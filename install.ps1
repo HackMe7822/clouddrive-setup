@@ -53,6 +53,8 @@ New-Item -ItemType Directory -Force -Path $COMPOSE_DIR | Out-Null
 Write-Step 1 6 "Docker Desktop..."
 
 function Test-DockerRunning {
+    # Must check command exists first — missing docker leaves $LASTEXITCODE unchanged (false positive)
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $false }
     docker info 2>&1 | Out-Null
     return $LASTEXITCODE -eq 0
 }
