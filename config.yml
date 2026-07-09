@@ -1,0 +1,9 @@
+tunnel: f3dbfee9-854c-4f1b-9f60-76fce34c561e
+credentials-file: C:\CloudDrive\tunnel.json
+
+ingress:
+  - hostname: drive.creationsit.com
+    service: http://localhost:8080
+  - hostname: files.creationsit.com
+    service: http://localhost:8080
+  - service: http_status:404

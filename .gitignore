@@ -1,0 +1,7 @@
+filebrowser.exe
+filebrowser.db
+*.json
+!tunnel.example.json
+CHANGELOG.md
+LICENSE
+README.md.bak
