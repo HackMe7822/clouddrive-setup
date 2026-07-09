@@ -1,257 +1,257 @@
 # ================================================================
-#  Nextcloud Installer for Windows
-#  Personal cloud drive - accessible from anywhere via Cloudflare
+#  CloudDrive - Native Windows Installer
+#  Nextcloud on PHP + MariaDB + Caddy, no Docker needed
+#  USB drives appear instantly - no container restarts
 #  Run as Administrator in PowerShell
 #  GitHub: https://github.com/HackMe7822/clouddrive-setup
 # ================================================================
 #
-#  EDIT THESE 3 LINES BEFORE RUNNING:
+#  EDIT THESE BEFORE RUNNING:
 # ================================================================
-$SUBDOMAIN  = "files.yourdomain.com"    # your public URL
-$ADMIN_USER = "admin"                   # Nextcloud admin username
-$ADMIN_PASS = "ChangeMe@123"            # Nextcloud admin password
-# ================================================================
-
-$INSTALL_DIR = "C:\CloudDrive"
-$NC_DATA_DIR = "D:\NextcloudData"       # Nextcloud files (change drive if needed)
-$NC_DB_DIR   = "D:\NextcloudDB"         # Database files
+$SUBDOMAIN   = "files.yourdomain.com"   # your public URL
+$ADMIN_USER  = "admin"
+$ADMIN_PASS  = "ChangeMe@123"           # change after install
+$NC_DATA_DIR = "D:\NextcloudData"       # where user files are stored
+$NC_DIR      = "C:\Nextcloud"           # Nextcloud app files
 $NC_PORT     = 8080
+$PHP_PORT    = 9123                     # internal PHP-CGI port
+$INSTALL_DIR = "C:\CloudDrive"
 $CF_DIR      = "$env:USERPROFILE\.cloudflared"
-$COMPOSE_DIR = "$INSTALL_DIR\nextcloud"
-$RESUME_FLAG = "$INSTALL_DIR\install-resume.flag"
+# ================================================================
 
-# ---- Admin check ----
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    Write-Host "ERROR: Run this script as Administrator." -ForegroundColor Red
-    Write-Host "Right-click PowerShell -> Run as Administrator" -ForegroundColor Yellow
-    pause; exit 1
+if (-not $isAdmin) { Write-Host "Run as Administrator!" -ForegroundColor Red; pause; exit 1 }
+
+function Write-Step($n, $total, $msg) { Write-Host "`n[$n/$total] $msg" -ForegroundColor Yellow }
+function Invoke-Occ($args) {
+    $php = (Get-Command php -ErrorAction SilentlyContinue).Source
+    if (-not $php) { $php = Get-ChildItem "C:\php\php.exe","C:\PHP\php.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName }
+    & $php "$NC_DIR\occ" @args 2>&1
 }
 
-function Write-Step($n, $total, $msg) {
-    Write-Host ""
-    Write-Host "[$n/$total] $msg" -ForegroundColor Yellow
-}
-
-$isResume = Test-Path $RESUME_FLAG
-
-if (-not $isResume) {
-    Write-Host ""
-    Write-Host "=================================================" -ForegroundColor Cyan
-    Write-Host "  Nextcloud Cloud Drive Installer" -ForegroundColor Cyan
-    Write-Host "=================================================" -ForegroundColor Cyan
-}
+Write-Host "`n=================================================" -ForegroundColor Cyan
+Write-Host "  CloudDrive Native Installer" -ForegroundColor Cyan
+Write-Host "=================================================" -ForegroundColor Cyan
 
 New-Item -ItemType Directory -Force -Path $INSTALL_DIR | Out-Null
 New-Item -ItemType Directory -Force -Path $NC_DATA_DIR | Out-Null
-New-Item -ItemType Directory -Force -Path $NC_DB_DIR   | Out-Null
-New-Item -ItemType Directory -Force -Path $COMPOSE_DIR | Out-Null
 
 # ================================================================
-# STEP 1 - Docker Desktop
+# STEP 1 - Install PHP, MariaDB, Caddy
 # ================================================================
-Write-Step 1 6 "Docker Desktop..."
+Write-Step 1 7 "Installing PHP, MariaDB, Caddy..."
 
-# Ensure Docker CLI is in PATH (winget installs it but doesn't always update current session PATH)
-$dockerBinPath = "C:\Program Files\Docker\Docker\resources\bin"
-if (Test-Path $dockerBinPath) { $env:PATH += ";$dockerBinPath" }
+winget install PHP.PHP          --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+winget install MariaDB.Server   --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+winget install CaddyServer.Caddy --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
 
-function Test-DockerRunning {
-    # Must check command exists first — missing docker leaves $LASTEXITCODE unchanged (false positive)
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $false }
-    docker info 2>&1 | Out-Null
-    return $LASTEXITCODE -eq 0
+# Refresh PATH
+$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
+
+# Find PHP
+$phpExe = (Get-Command php -ErrorAction SilentlyContinue).Source
+if (-not $phpExe) {
+    $phpExe = @("C:\php\php.exe","C:\PHP\php.exe","C:\Program Files\PHP\php.exe") |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
 }
+if (-not $phpExe) { Write-Host "PHP not found after install. Please install PHP manually and re-run." -ForegroundColor Red; pause; exit 1 }
+$phpDir    = Split-Path $phpExe
+$phpCgiExe = Join-Path $phpDir "php-cgi.exe"
+$phpIni    = Join-Path $phpDir "php.ini"
+Write-Host "  PHP: $phpExe" -ForegroundColor Green
 
-function Wait-ForDocker($timeoutSec) {
-    Write-Host "  Waiting for Docker daemon (up to $timeoutSec sec)..." -ForegroundColor Gray
-    $elapsed = 0
-    while ($elapsed -lt $timeoutSec) {
-        Start-Sleep 5
-        $elapsed += 5
-        if (Test-DockerRunning) {
-            Write-Host "  Docker is ready." -ForegroundColor Green
-            return $true
-        }
-        Write-Host "  Still starting... ($elapsed/$timeoutSec sec)" -ForegroundColor Gray
-    }
-    return $false
+# Configure php.ini
+if (Test-Path "$phpDir\php.ini-production") { Copy-Item "$phpDir\php.ini-production" $phpIni -Force }
+$extensions = @("curl","gd","intl","mbstring","openssl","pdo_mysql","zip","fileinfo","bcmath","exif","gmp","imagick","ldap")
+foreach ($ext in $extensions) {
+    (Get-Content $phpIni) -replace ";extension=$ext", "extension=$ext" | Set-Content $phpIni
 }
+# Set required php.ini values
+(Get-Content $phpIni) -replace "^;?date.timezone =.*", "date.timezone = Asia/Kolkata" `
+                      -replace "^;?memory_limit =.*", "memory_limit = 512M" `
+                      -replace "^;?upload_max_filesize =.*", "upload_max_filesize = 10G" `
+                      -replace "^;?post_max_size =.*", "post_max_size = 10G" `
+                      -replace "^;?max_execution_time =.*", "max_execution_time = 3600" `
+                      -replace "^;?output_buffering =.*", "output_buffering = Off" | Set-Content $phpIni
+Write-Host "  PHP configured." -ForegroundColor Green
 
-if (Test-DockerRunning) {
-    Write-Host "  Docker already running." -ForegroundColor Green
+# Find Caddy
+$caddyExe = (Get-Command caddy -ErrorAction SilentlyContinue).Source
+if (-not $caddyExe) {
+    $caddyExe = @("C:\Program Files\Caddy\caddy.exe","C:\ProgramData\caddy\caddy.exe") |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+Write-Host "  Caddy: $caddyExe" -ForegroundColor Green
+
+# Find MariaDB mysql
+$mysqlExe = Get-ChildItem "C:\Program Files\MariaDB*\bin\mysql.exe" -Recurse -ErrorAction SilentlyContinue |
+    Select-Object -First 1 -ExpandProperty FullName
+if (-not $mysqlExe) {
+    $mysqlExe = (Get-Command mysql -ErrorAction SilentlyContinue).Source
+}
+Write-Host "  MariaDB mysql: $mysqlExe" -ForegroundColor Green
+
+# ================================================================
+# STEP 2 - Database setup
+# ================================================================
+Write-Step 2 7 "Setting up database..."
+
+# Start MariaDB service
+$dbService = Get-Service -Name "MySQL*","MariaDB*" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($dbService) {
+    Start-Service $dbService.Name -ErrorAction SilentlyContinue
+    Write-Host "  Started $($dbService.Name)" -ForegroundColor Green
 } else {
-    $dockerDesktop = "C:\Program Files\Docker\Docker\Docker Desktop.exe"
-    $dockerInstalled = Test-Path $dockerDesktop
-
-    if (-not $dockerInstalled) {
-        Write-Host "  Installing Docker Desktop via winget..." -ForegroundColor Gray
-        winget install Docker.DockerDesktop --silent --accept-package-agreements --accept-source-agreements
-        $dockerInstalled = Test-Path $dockerDesktop
-    }
-
-    if ($dockerInstalled) {
-        Write-Host "  Starting Docker Desktop..." -ForegroundColor Gray
-        Start-Process -FilePath $dockerDesktop
-    }
-
-    $ready = Wait-ForDocker 180
-
-    if (-not $ready) {
-        Write-Host ""
-        Write-Host "  Docker Desktop may need you to accept a license or finish setup." -ForegroundColor Cyan
-        Write-Host "  Please open Docker Desktop from your taskbar, accept any prompts," -ForegroundColor Cyan
-        Write-Host "  wait for the whale icon to stop animating, then press Enter." -ForegroundColor Cyan
-        Read-Host "  Press Enter to continue"
-        $ready = Wait-ForDocker 60
-    }
-
-    if (-not $ready) {
-        # Save flag and schedule resume after restart
-        "pending" | Set-Content $RESUME_FLAG
-        $scriptPath = $MyInvocation.MyCommand.Path
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" `
-            -Name "NextcloudInstallResume" `
-            -Value "powershell.exe -ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`""
-        Write-Host ""
-        Write-Host "  Docker needs a system restart (WSL2 setup)." -ForegroundColor Yellow
-        Write-Host "  This script will AUTO-RESUME after you restart and log in." -ForegroundColor Green
-        $choice = Read-Host "  Restart now? (Y/N)"
-        if ($choice -eq "Y" -or $choice -eq "y") { Restart-Computer -Force }
-        exit
+    Write-Host "  MariaDB service not found - trying to initialize..." -ForegroundColor Yellow
+    $mysqldExe = Split-Path $mysqlExe | ForEach-Object { Join-Path $_ "mysqld.exe" }
+    if (Test-Path $mysqldExe) {
+        & $mysqldExe --install MySQL --defaults-file="$(Split-Path $mysqlExe)\my.ini" 2>&1 | Out-Null
+        Start-Service MySQL
     }
 }
+Start-Sleep 3
 
-# Clean up resume state
-Remove-Item $RESUME_FLAG -Force -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" -Name "NextcloudInstallResume" -ErrorAction SilentlyContinue
-
-# ================================================================
-# STEP 2 - Remove FileBrowser (replaced by Nextcloud)
-# ================================================================
-Write-Step 2 6 "Removing FileBrowser..."
-Stop-ScheduledTask -TaskName "FileBrowser" -ErrorAction SilentlyContinue
-Stop-Process -Name "filebrowser" -Force -ErrorAction SilentlyContinue
-Unregister-ScheduledTask -TaskName "FileBrowser" -Confirm:$false -ErrorAction SilentlyContinue
-Write-Host "  FileBrowser removed." -ForegroundColor Green
-
-# ================================================================
-# STEP 3 - Nextcloud via Docker Compose
-# ================================================================
-Write-Step 3 6 "Setting up Nextcloud containers..."
-
-# Generate random DB passwords (no external dependencies)
+# Generate DB password
 $chars  = (65..90) + (97..122) + (48..57)
 $dbPass = -join ($chars | Get-Random -Count 24 | ForEach-Object { [char]$_ })
-$dbRoot = -join ($chars | Get-Random -Count 24 | ForEach-Object { [char]$_ })
 
-# Write docker-compose.yml
-$composeFile = "$COMPOSE_DIR\docker-compose.yml"
-@"
-services:
-  db:
-    image: mariadb:10.11
-    restart: always
-    command: --transaction-isolation=READ-COMMITTED --log-bin=binlog --binlog-format=ROW
-    volumes:
-      - $($NC_DB_DIR -replace '\\','/'):/var/lib/mysql
-    environment:
-      MYSQL_ROOT_PASSWORD: $dbRoot
-      MYSQL_DATABASE: nextcloud
-      MYSQL_USER: nextcloud
-      MYSQL_PASSWORD: $dbPass
-    healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+# Create database and user
+$sqlCmds = "CREATE DATABASE IF NOT EXISTS nextcloud CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci; CREATE USER IF NOT EXISTS 'nextcloud'@'localhost' IDENTIFIED BY '$dbPass'; GRANT ALL PRIVILEGES ON nextcloud.* TO 'nextcloud'@'localhost'; FLUSH PRIVILEGES;"
+& $mysqlExe -u root --execute="$sqlCmds" 2>&1 | Out-Null
+Write-Host "  Database 'nextcloud' created." -ForegroundColor Green
 
-  nextcloud:
-    image: nextcloud:latest
-    restart: always
-    ports:
-      - "127.0.0.1:${NC_PORT}:80"
-    volumes:
-      - $($NC_DATA_DIR -replace '\\','/'):/var/www/html
-    environment:
-      MYSQL_HOST: db
-      MYSQL_DATABASE: nextcloud
-      MYSQL_USER: nextcloud
-      MYSQL_PASSWORD: $dbPass
-      NEXTCLOUD_ADMIN_USER: $ADMIN_USER
-      NEXTCLOUD_ADMIN_PASSWORD: $ADMIN_PASS
-      NEXTCLOUD_TRUSTED_DOMAINS: $SUBDOMAIN localhost 127.0.0.1
-    depends_on:
-      db:
-        condition: service_healthy
-"@ | Set-Content $composeFile -Encoding UTF8
+# Save DB password
+"DB_PASS=$dbPass" | Set-Content "$INSTALL_DIR\db.env" -Encoding UTF8
 
-Set-Location $COMPOSE_DIR
-Write-Host "  Pulling images (this may take a few minutes)..." -ForegroundColor Gray
-docker compose pull
-Write-Host "  Starting containers..." -ForegroundColor Gray
-docker compose up -d
+# ================================================================
+# STEP 3 - Download and install Nextcloud
+# ================================================================
+Write-Step 3 7 "Downloading Nextcloud..."
 
-Write-Host "  Containers started. Waiting for Nextcloud to initialize (~2 min)..." -ForegroundColor Gray
-$elapsed = 0
-while ($elapsed -lt 180) {
-    Start-Sleep 10
-    $elapsed += 10
-    try {
-        $r = Invoke-WebRequest -Uri "http://localhost:$NC_PORT/status.php" -UseBasicParsing -TimeoutSec 5
-        if ($r.StatusCode -eq 200) {
-            Write-Host "  Nextcloud is up!" -ForegroundColor Green
-            break
-        }
-    } catch {}
-    Write-Host "  Initializing... ($elapsed sec)" -ForegroundColor Gray
+if (Test-Path "$NC_DIR\occ") {
+    Write-Host "  Nextcloud already installed at $NC_DIR, skipping download." -ForegroundColor Gray
+} else {
+    $ncZip = "$INSTALL_DIR\nextcloud.zip"
+    Write-Host "  Downloading latest Nextcloud (~200MB)..." -ForegroundColor Gray
+    Invoke-WebRequest -Uri "https://download.nextcloud.com/server/releases/latest.zip" -OutFile $ncZip -UseBasicParsing
+    Write-Host "  Extracting..." -ForegroundColor Gray
+    Expand-Archive -Path $ncZip -DestinationPath "C:\" -Force
+    Remove-Item $ncZip -Force
+    Write-Host "  Nextcloud extracted to $NC_DIR" -ForegroundColor Green
+}
+
+# Set folder permissions for www-data equivalent (running as SYSTEM)
+$acl = Get-Acl $NC_DIR
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule("SYSTEM","FullControl","ContainerInherit,ObjectInherit","None","Allow")
+$acl.SetAccessRule($rule)
+Set-Acl $NC_DIR $acl
+
+Write-Host "  Installing Nextcloud (this takes ~2 minutes)..." -ForegroundColor Gray
+& $phpExe "$NC_DIR\occ" maintenance:install `
+    --database "mysql" `
+    --database-host "127.0.0.1" `
+    --database-name "nextcloud" `
+    --database-user "nextcloud" `
+    --database-pass "$dbPass" `
+    --admin-user "$ADMIN_USER" `
+    --admin-pass "$ADMIN_PASS" `
+    --data-dir "$NC_DATA_DIR" 2>&1
+
+& $phpExe "$NC_DIR\occ" config:system:set trusted_domains 0 --value="localhost"
+& $phpExe "$NC_DIR\occ" config:system:set trusted_domains 1 --value="$SUBDOMAIN"
+& $phpExe "$NC_DIR\occ" config:system:set trusted_domains 2 --value="127.0.0.1"
+& $phpExe "$NC_DIR\occ" config:system:set overwrite.cli.url --value="https://$SUBDOMAIN"
+& $phpExe "$NC_DIR\occ" config:system:set overwriteprotocol --value="https"
+Write-Host "  Nextcloud installed." -ForegroundColor Green
+
+# ================================================================
+# STEP 4 - External Storage (all drives, instant USB support)
+# ================================================================
+Write-Step 4 7 "Configuring drive access..."
+
+& $phpExe "$NC_DIR\occ" app:enable files_external 2>&1 | Out-Null
+& $phpExe "$NC_DIR\occ" config:app:set core enable_external_storage --value=yes 2>&1 | Out-Null
+
+$drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match "^[A-Z]:\\" }
+foreach ($drive in $drives) {
+    $letter = $drive.Name
+    $path   = $drive.Root -replace "\\$", ""
+    & $phpExe "$NC_DIR\occ" files_external:create "${letter}-Drive" local null::null --config "datadir=$path" 2>&1 | Out-Null
+    Write-Host "  Added $letter: as external storage" -ForegroundColor Green
+}
+
+# Save known drives for USB watcher
+$knownDrives = @{ drives = @($drives | ForEach-Object { $_.Name }) }
+$knownDrives | ConvertTo-Json | Set-Content "$INSTALL_DIR\known-drives.json" -Encoding UTF8
+
+# Copy USB watcher script
+if (Test-Path "$PSScriptRoot\usb-watcher.ps1") {
+    Copy-Item "$PSScriptRoot\usb-watcher.ps1" "$INSTALL_DIR\usb-watcher.ps1" -Force
 }
 
 # ================================================================
-# STEP 4 - Cloudflare Tunnel
+# STEP 5 - Caddy web server config
 # ================================================================
-Write-Step 4 6 "Cloudflare Tunnel..."
+Write-Step 5 7 "Configuring web server..."
 
-$cfExe = (Get-Command cloudflared -ErrorAction SilentlyContinue)
-if (-not $cfExe) {
-    Write-Host "  Installing cloudflared..." -ForegroundColor Gray
+$caddyFile = "$INSTALL_DIR\Caddyfile"
+@"
+:$NC_PORT {
+    root * $NC_DIR
+
+    rewrite /.well-known/carddav /remote.php/dav
+    rewrite /.well-known/caldav  /remote.php/dav
+
+    encode gzip
+
+    php_fastcgi localhost:$PHP_PORT {
+        env PATH $phpDir
+    }
+
+    file_server
+
+    @forbidden {
+        path /.htaccess /data/* /config/* /db_structure /.xml /README
+        path /3rdparty/* /lib/* /templates/* /occ /console.php
+    }
+    respond @forbidden 404
+}
+"@ | Set-Content $caddyFile -Encoding UTF8
+Write-Host "  Caddyfile written." -ForegroundColor Green
+
+# ================================================================
+# STEP 6 - Cloudflare Tunnel
+# ================================================================
+Write-Step 6 7 "Cloudflare Tunnel..."
+
+$cfInstalled = Get-Command cloudflared -ErrorAction SilentlyContinue
+if (-not $cfInstalled) {
     winget install Cloudflare.cloudflared --silent --accept-package-agreements
     $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
-    $cfExe = Get-Command cloudflared -ErrorAction SilentlyContinue
 }
-$cfBin = $cfExe.Source
+$cfBin = (Get-Command cloudflared).Source
 
-# Login if no cert
 if (-not (Test-Path "$CF_DIR\cert.pem")) {
-    Write-Host "  A browser will open - log into your Cloudflare account." -ForegroundColor Cyan
+    Write-Host "  A browser will open - log into Cloudflare." -ForegroundColor Cyan
     & $cfBin tunnel login
 }
 
-# Find or create tunnel credentials
-$credJson = Get-ChildItem $CF_DIR -Filter "*.json" -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -ne "cert.json" } |
-    Select-Object -First 1
-
+$credJson  = Get-ChildItem $CF_DIR -Filter "*.json" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne "cert.json" } | Select-Object -First 1
 $localCred = "$INSTALL_DIR\tunnel.json"
 
 if ($credJson) {
     $tunnelId = $credJson.BaseName
-    if (-not (Test-Path $localCred)) {
-        Copy-Item $credJson.FullName $localCred -Force
-    }
+    if (-not (Test-Path $localCred)) { Copy-Item $credJson.FullName $localCred -Force }
     Write-Host "  Using existing tunnel: $tunnelId" -ForegroundColor Green
 } else {
-    Write-Host "  Creating new tunnel..." -ForegroundColor Gray
     & $cfBin tunnel create files-drive 2>&1 | Out-Null
-    $credJson = Get-ChildItem $CF_DIR -Filter "*.json" |
-        Where-Object { $_.Name -ne "cert.json" } |
-        Select-Object -First 1
-    $tunnelId = $credJson.BaseName
+    $credJson  = Get-ChildItem $CF_DIR -Filter "*.json" | Where-Object { $_.Name -ne "cert.json" } | Select-Object -First 1
+    $tunnelId  = $credJson.BaseName
     Copy-Item $credJson.FullName $localCred -Force
-    Write-Host "  Tunnel created: $tunnelId" -ForegroundColor Green
+    Write-Host "  Created tunnel: $tunnelId" -ForegroundColor Green
 }
 
-# Write config.yml
 $configPath = "$INSTALL_DIR\config.yml"
 @"
 tunnel: $tunnelId
@@ -263,97 +263,85 @@ ingress:
   - service: http_status:404
 "@ | Set-Content $configPath -Encoding UTF8
 
-# Add DNS route via cloudflared
-& $cfBin tunnel route dns --overwrite-dns $tunnelId $SUBDOMAIN 2>&1 | Out-Null
-Write-Host "  Tunnel configured." -ForegroundColor Green
-
-# ================================================================
-# STEP 5 - DNS record via Cloudflare API
-# ================================================================
-Write-Step 5 6 "Cloudflare DNS..."
-
-$domain      = ($SUBDOMAIN -split "\." | Select-Object -Last 2) -join "."
-$subdName    = ($SUBDOMAIN -split "\.")[0]
-$cnameTarget = "$tunnelId.cfargotunnel.com"
+# DNS update
+$domain   = ($SUBDOMAIN -split "\." | Select-Object -Last 2) -join "."
+$subdName = ($SUBDOMAIN -split "\.")[0]
+$cname    = "$tunnelId.cfargotunnel.com"
 
 Write-Host ""
-Write-Host "  Provide a Cloudflare API token to auto-update DNS." -ForegroundColor Cyan
-Write-Host "  Get one at: dash.cloudflare.com -> My Profile -> API Tokens" -ForegroundColor Gray
-Write-Host "  Template: Edit zone DNS | Permissions: Zone:Read + Zone:DNS:Edit" -ForegroundColor Gray
-Write-Host ""
-$cfToken = Read-Host "  Paste API token (or press Enter to skip)"
+Write-Host "  Cloudflare API token for auto DNS update (or Enter to skip):" -ForegroundColor Cyan
+Write-Host "  dash.cloudflare.com -> My Profile -> API Tokens -> Edit zone DNS template" -ForegroundColor Gray
+$cfToken = Read-Host "  Token"
 
 if ($cfToken.Trim() -ne "") {
-    $headers = @{ "Authorization" = "Bearer $($cfToken.Trim())"; "Content-Type" = "application/json" }
+    $h = @{ "Authorization" = "Bearer $($cfToken.Trim())"; "Content-Type" = "application/json" }
     try {
-        $zoneResp = Invoke-RestMethod "https://api.cloudflare.com/client/v4/zones?name=$domain" -Headers $headers
-        $zoneId   = $zoneResp.result[0].id
-        $recResp  = Invoke-RestMethod "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records?type=CNAME&name=$SUBDOMAIN" -Headers $headers
-        $body     = @{ type="CNAME"; name=$subdName; content=$cnameTarget; proxied=$true } | ConvertTo-Json
-
-        if ($recResp.result.Count -gt 0) {
-            $recId = $recResp.result[0].id
-            Invoke-RestMethod "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records/$recId" -Method Put -Headers $headers -Body $body | Out-Null
-            Write-Host "  DNS record updated: $SUBDOMAIN -> $cnameTarget" -ForegroundColor Green
+        $zoneId = (Invoke-RestMethod "https://api.cloudflare.com/client/v4/zones?name=$domain" -Headers $h).result[0].id
+        $rec    = (Invoke-RestMethod "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records?type=CNAME&name=$SUBDOMAIN" -Headers $h).result
+        $body   = @{ type="CNAME"; name=$subdName; content=$cname; proxied=$true } | ConvertTo-Json
+        if ($rec.Count -gt 0) {
+            Invoke-RestMethod "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records/$($rec[0].id)" -Method Put -Headers $h -Body $body | Out-Null
+            Write-Host "  DNS updated: $SUBDOMAIN -> $cname" -ForegroundColor Green
         } else {
-            Invoke-RestMethod "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records" -Method Post -Headers $headers -Body $body | Out-Null
-            Write-Host "  DNS record created: $SUBDOMAIN -> $cnameTarget" -ForegroundColor Green
+            Invoke-RestMethod "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records" -Method Post -Headers $h -Body $body | Out-Null
+            Write-Host "  DNS created: $SUBDOMAIN -> $cname" -ForegroundColor Green
         }
-    } catch {
-        Write-Host "  DNS API failed. Add manually in Cloudflare dashboard:" -ForegroundColor Yellow
-        Write-Host "    CNAME  $subdName  ->  $cnameTarget  (Proxied ON)" -ForegroundColor White
-    }
+    } catch { Write-Host "  DNS API failed. Add manually: CNAME $subdName -> $cname (Proxied ON)" -ForegroundColor Yellow }
 } else {
-    Write-Host "  Skipped. Add this record in Cloudflare dashboard:" -ForegroundColor Yellow
+    Write-Host "  Add this DNS record at your domain provider (works with ANY provider):" -ForegroundColor Yellow
     Write-Host "    Type:   CNAME" -ForegroundColor White
     Write-Host "    Name:   $subdName" -ForegroundColor White
-    Write-Host "    Target: $cnameTarget" -ForegroundColor White
-    Write-Host "    Proxy:  ON (orange cloud)" -ForegroundColor White
+    Write-Host "    Target: $cname" -ForegroundColor White
+    Write-Host "    Note:   If using Cloudflare DNS, enable orange cloud (Proxied)" -ForegroundColor White
 }
 
 # ================================================================
-# STEP 6 - Startup tasks
+# STEP 7 - Register all startup tasks
 # ================================================================
-Write-Step 6 6 "Registering startup tasks..."
+Write-Step 7 7 "Registering startup tasks..."
 
-# DriveWatcher (auto-maps new drives to C:\CloudRoot every 5 min)
-$watcherScript = @'
-$drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match "^[A-Z]:\\" }
-foreach ($drive in $drives) {
-    $jp = "C:\CloudRoot\$($drive.Name)-Drive"
-    if (-not (Test-Path $jp)) {
-        New-Item -ItemType Directory -Force -Path "C:\CloudRoot" | Out-Null
-        & cmd /c "mklink /J `"$jp`" `"$($drive.Root)`""
-    }
-}
-'@
-$watcherScript | Set-Content "$INSTALL_DIR\drive-watcher.ps1" -Encoding UTF8
+# PHP-CGI task (FastCGI server for Caddy)
+schtasks /delete /tn "PhpCgi"    /f 2>$null
+schtasks /create /tn "PhpCgi" `
+    /tr "`"$phpCgiExe`" -b 127.0.0.1:$PHP_PORT" `
+    /sc ONSTART /ru SYSTEM /rl HIGHEST /f | Out-Null
+schtasks /run /tn "PhpCgi" | Out-Null
+Write-Host "  PHP-CGI task registered." -ForegroundColor Green
 
-schtasks /delete /tn "DriveWatcher"      /f 2>$null
-schtasks /delete /tn "DriveWatcherBoot"  /f 2>$null
-$dwCmd = "powershell.exe -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File $INSTALL_DIR\drive-watcher.ps1"
-schtasks /create /tn "DriveWatcher"     /tr $dwCmd /sc MINUTE /mo 5  /ru SYSTEM /rl HIGHEST /f | Out-Null
-schtasks /create /tn "DriveWatcherBoot" /tr $dwCmd /sc ONSTART        /ru SYSTEM /rl HIGHEST /f | Out-Null
-Write-Host "  DriveWatcher registered (every 5 min + at boot)." -ForegroundColor Green
+# Caddy task
+schtasks /delete /tn "CaddyServer" /f 2>$null
+schtasks /create /tn "CaddyServer" `
+    /tr "`"$caddyExe`" run --config `"$caddyFile`"" `
+    /sc ONSTART /ru SYSTEM /rl HIGHEST /f | Out-Null
+schtasks /run /tn "CaddyServer" | Out-Null
+Write-Host "  Caddy task registered." -ForegroundColor Green
 
-# Cloudflared tunnel task
+# Cloudflared task
 Unregister-ScheduledTask -TaskName "CloudflaredTunnel" -Confirm:$false -ErrorAction SilentlyContinue
-$cfAction    = New-ScheduledTaskAction -Execute $cfBin -Argument "tunnel --config $configPath run"
+$cfAction    = New-ScheduledTaskAction -Execute $cfBin -Argument "tunnel --config `"$configPath`" run"
 $cfTrigger   = New-ScheduledTaskTrigger -AtStartup
 $cfSettings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 0) -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1)
 $cfPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-Register-ScheduledTask -TaskName "CloudflaredTunnel" -Action $cfAction -Trigger $cfTrigger -Settings $cfSettings -Principal $cfPrincipal -Description "Cloudflare Tunnel -> $SUBDOMAIN" | Out-Null
+Register-ScheduledTask -TaskName "CloudflaredTunnel" -Action $cfAction -Trigger $cfTrigger -Settings $cfSettings -Principal $cfPrincipal | Out-Null
 Start-ScheduledTask -TaskName "CloudflaredTunnel" -ErrorAction SilentlyContinue
-Write-Host "  Cloudflared tunnel task registered." -ForegroundColor Green
+Write-Host "  Cloudflared task registered." -ForegroundColor Green
 
-# Docker auto-starts on boot by default (no extra task needed)
-# Make sure Docker Desktop launches on login
-$dockerDesktopExe = "C:\Program Files\Docker\Docker\Docker Desktop.exe"
-if (Test-Path $dockerDesktopExe) {
-    $regPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-    Set-ItemProperty -Path $regPath -Name "DockerDesktop" -Value "`"$dockerDesktopExe`" -Autostart"
-    Write-Host "  Docker Desktop set to launch on login." -ForegroundColor Green
-}
+# USB Watcher task (runs every 10 sec via a loop inside the script)
+schtasks /delete /tn "UsbWatcher" /f 2>$null
+schtasks /create /tn "UsbWatcher" `
+    /tr "powershell.exe -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$INSTALL_DIR\usb-watcher.ps1`"" `
+    /sc ONSTART /ru SYSTEM /rl HIGHEST /f | Out-Null
+Copy-Item "$PSScriptRoot\usb-watcher.ps1" "$INSTALL_DIR\usb-watcher.ps1" -Force -ErrorAction SilentlyContinue
+schtasks /run /tn "UsbWatcher" | Out-Null
+Write-Host "  USB Watcher task registered." -ForegroundColor Green
+
+# Wait a moment then test
+Start-Sleep 5
+try {
+    $r = Invoke-WebRequest -Uri "http://localhost:$NC_PORT/status.php" -UseBasicParsing -TimeoutSec 5
+    $status = $r.Content | ConvertFrom-Json
+    Write-Host "  Nextcloud running: v$($status.versionstring)" -ForegroundColor Green
+} catch { Write-Host "  Nextcloud not responding yet - may need a minute to start." -ForegroundColor Yellow }
 
 # ================================================================
 # DONE
@@ -362,16 +350,13 @@ Write-Host ""
 Write-Host "=================================================" -ForegroundColor Green
 Write-Host "  INSTALL COMPLETE!" -ForegroundColor Green
 Write-Host "=================================================" -ForegroundColor Green
-Write-Host "  URL:       https://$SUBDOMAIN" -ForegroundColor Cyan
-Write-Host "  Username:  $ADMIN_USER" -ForegroundColor White
-Write-Host "  Password:  $ADMIN_PASS" -ForegroundColor White
+Write-Host "  URL:      https://$SUBDOMAIN" -ForegroundColor Cyan
+Write-Host "  Username: $ADMIN_USER" -ForegroundColor White
+Write-Host "  Password: $ADMIN_PASS  <-- change this!" -ForegroundColor Red
 Write-Host ""
-Write-Host "  Data stored at:  $NC_DATA_DIR" -ForegroundColor Gray
-Write-Host "  Database at:     $NC_DB_DIR" -ForegroundColor Gray
+Write-Host "  Drives accessible:" -ForegroundColor Yellow
+foreach ($d in $drives) { Write-Host "    $($d.Name)-Drive -> $($d.Root)" -ForegroundColor White }
 Write-Host ""
-Write-Host "  New drives auto-detected every 5 minutes." -ForegroundColor Gray
-Write-Host "  Nextcloud and tunnel start automatically on reboot." -ForegroundColor Gray
-Write-Host "=================================================" -ForegroundColor Green
-Write-Host ""
-Write-Host "  IMPORTANT: Change your password after first login!" -ForegroundColor Red
+Write-Host "  USB drives: plug in -> appears in Nextcloud within 10 sec" -ForegroundColor Cyan
+Write-Host "  Works with ANY DNS provider (Cloudflare, GoDaddy, Namecheap...)" -ForegroundColor Cyan
 Write-Host "=================================================" -ForegroundColor Green
