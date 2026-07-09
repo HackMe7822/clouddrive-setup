@@ -52,6 +52,10 @@ New-Item -ItemType Directory -Force -Path $COMPOSE_DIR | Out-Null
 # ================================================================
 Write-Step 1 6 "Docker Desktop..."
 
+# Ensure Docker CLI is in PATH (winget installs it but doesn't always update current session PATH)
+$dockerBinPath = "C:\Program Files\Docker\Docker\resources\bin"
+if (Test-Path $dockerBinPath) { $env:PATH += ";$dockerBinPath" }
+
 function Test-DockerRunning {
     # Must check command exists first — missing docker leaves $LASTEXITCODE unchanged (false positive)
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $false }
@@ -144,8 +148,6 @@ $dbRoot = -join ($chars | Get-Random -Count 24 | ForEach-Object { [char]$_ })
 # Write docker-compose.yml
 $composeFile = "$COMPOSE_DIR\docker-compose.yml"
 @"
-version: '3.8'
-
 services:
   db:
     image: mariadb:10.11
