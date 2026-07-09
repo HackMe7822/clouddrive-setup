@@ -1,90 +1,108 @@
-# CloudDrive Setup
+# CloudDrive — Personal Cloud on Windows
 
-Turn any Windows PC into a personal cloud drive accessible from anywhere via a Cloudflare Tunnel.
+Turn any Windows PC into a full cloud drive accessible from anywhere via Cloudflare Tunnel.
 
-**Stack:** [FileBrowser](https://github.com/filebrowser/filebrowser) + [Cloudflare Tunnel](https://github.com/cloudflare/cloudflared) — no port forwarding, no exposed IP, free tier.
+**Stack:** [Nextcloud](https://nextcloud.com) (in Docker) + [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) — no port forwarding, no exposed IP, free Cloudflare tier.
 
 ## What you get
 
-- All PC drives accessible at your custom domain (e.g. `files.yourdomain.com`)
+- Full Nextcloud — file manager, desktop sync app, mobile app, photo gallery
+- User accounts with per-folder permissions
+- File versioning and trash
+- Upload/download from any browser or the Nextcloud desktop/mobile app
 - HTTPS automatically via Cloudflare
-- User management with per-folder permissions
-- Upload, download, rename, delete from any browser
-- Auto-starts on boot, auto-restarts if it crashes
+- All PC drives accessible (auto-detects new drives every 5 min)
+- Everything starts automatically on reboot
 
 ## Prerequisites
 
-- Windows 10/11
-- A Cloudflare account with a domain pointed to Cloudflare DNS
+- Windows 10/11 (64-bit)
+- A domain on Cloudflare DNS
 - PowerShell running as Administrator
 
-## Install
+## Install — one script
 
-### 1. Clone this repo
+### 1. Clone or download
+
 ```powershell
 git clone https://github.com/HackMe7822/clouddrive-setup.git
 cd clouddrive-setup
 ```
 
-### 2. Edit config at the top of install.ps1
+### 2. Edit the 3 config lines at the top of install.ps1
+
 ```powershell
-$TUNNEL_NAME  = "files-drive"           # pick any name
-$SUBDOMAIN    = "files.yourdomain.com"  # your domain
-$ADMIN_PASS   = "ChangeMe@123"          # set a strong password
+$SUBDOMAIN  = "files.yourdomain.com"   # your public URL
+$ADMIN_USER = "admin"
+$ADMIN_PASS = "ChangeMe@123"           # use a strong password
 ```
 
-### 3. Set up Cloudflare Tunnel (one-time)
-```powershell
-cloudflared tunnel login
-cloudflared tunnel create files-drive
-cloudflared tunnel route dns files-drive files.yourdomain.com
-```
-Copy the generated credentials JSON to `C:\CloudDrive\tunnel.json` and update `config.yml`.
+### 3. Right-click install.ps1 → Run with PowerShell (as Administrator)
 
-### 4. Run the installer as Administrator
-```powershell
-Right-click install.ps1 -> Run with PowerShell (as Administrator)
-```
+The script handles everything:
+- Installs Docker Desktop if missing (handles restart automatically)
+- Pulls and starts Nextcloud + MariaDB containers
+- Removes any existing FileBrowser setup
+- Reuses existing Cloudflare Tunnel or creates a new one
+- Updates your Cloudflare DNS record (prompts for API token)
+- Registers all startup tasks
 
-### 5. Add DNS record in Cloudflare dashboard
-- Type: `CNAME`
-- Name: `files`
-- Target: `<tunnel-id>.cfargotunnel.com`
-- Proxy: ON (orange cloud)
+If a restart is needed (first-time Docker/WSL2 setup), the script auto-resumes after you log back in.
 
-## File structure
+### 4. Cloudflare API token (optional but recommended)
+
+When prompted, create a token at **dash.cloudflare.com → My Profile → API Tokens**:
+- Template: **Edit zone DNS**
+- Permissions: **Zone:Read** + **Zone:DNS:Edit**
+- Zone: your domain only
+
+If you skip this, add the CNAME manually in the Cloudflare dashboard (the script prints exactly what to add).
+
+## File locations
 
 ```
 C:\CloudDrive\
-  filebrowser.exe     # FileBrowser binary
-  filebrowser.db      # User accounts and config database
-  config.yml          # Cloudflare Tunnel config
-  tunnel.json         # Tunnel credentials (keep secret!)
+  config.yml          Cloudflare Tunnel config
+  tunnel.json         Tunnel credentials (keep secret)
+  drive-watcher.ps1   Auto-maps new drives every 5 min
+
+C:\CloudDrive\nextcloud\
+  docker-compose.yml  Nextcloud + MariaDB container config
+
+D:\NextcloudData\     Nextcloud files (user uploads, config)
+D:\NextcloudDB\       MariaDB database files
 
 C:\CloudRoot\
-  C-Drive\            # Junction -> C:\
-  D-Drive\            # Junction -> D:\
-  (more drives auto-detected)
+  C-Drive\            Junction -> C:\
+  D-Drive\            Junction -> D:\
+  (new drives appear here automatically)
 ```
 
-## User management
+## Adding a drive manually
 
-Settings -> Users in the FileBrowser web UI.
-
-| Field | Example | Effect |
-|-------|---------|--------|
-| Scope | `D-Drive/Projects` | Limits user to that folder only |
-| Admin | on/off | Full access vs restricted |
-| Permissions | toggles | Create / Delete / Download etc |
-
-## Adding new drives
-
-Run as Administrator:
 ```powershell
+# Run as Administrator
 mklink /J "C:\CloudRoot\E-Drive" "E:\"
 ```
-The drive appears instantly in FileBrowser — no restart needed.
 
-## Live file detection
+Shows up in Nextcloud within seconds — no restart needed.
 
-FileBrowser reads the filesystem live. Any file added to a drive by any app or user shows up immediately on next refresh — no sync delay.
+## Managing containers
+
+```powershell
+cd C:\CloudDrive\nextcloud
+
+docker compose ps          # check status
+docker compose restart     # restart both containers
+docker compose down        # stop
+docker compose up -d       # start
+docker compose logs -f     # view logs
+```
+
+## Updating Nextcloud
+
+```powershell
+cd C:\CloudDrive\nextcloud
+docker compose pull
+docker compose up -d
+```
