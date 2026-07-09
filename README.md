@@ -2,7 +2,7 @@
 
 Turn any Windows PC into a full cloud drive accessible from anywhere via Cloudflare Tunnel.
 
-**Stack:** [Nextcloud](https://nextcloud.com) (in Docker) + [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) — no port forwarding, no exposed IP, free Cloudflare tier.
+**Stack:** [Nextcloud](https://nextcloud.com) (native PHP + MariaDB + Caddy) + [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) — no Docker, no port forwarding, no exposed IP, free Cloudflare tier.
 
 ## What you get
 
@@ -11,13 +11,14 @@ Turn any Windows PC into a full cloud drive accessible from anywhere via Cloudfl
 - File versioning and trash
 - Upload/download from any browser or the Nextcloud desktop/mobile app
 - HTTPS automatically via Cloudflare
-- All PC drives accessible (auto-detects new drives every 5 min)
+- All PC drives accessible (C:, D:, any USB — auto-detected within 10 seconds)
 - Everything starts automatically on reboot
+- Works with **any DNS provider** (Cloudflare, GoDaddy, Namecheap, etc.)
 
 ## Prerequisites
 
 - Windows 10/11 (64-bit)
-- A domain on Cloudflare DNS
+- A domain at any DNS provider
 - PowerShell running as Administrator
 
 ## Install — one script
@@ -29,7 +30,7 @@ git clone https://github.com/HackMe7822/clouddrive-setup.git
 cd clouddrive-setup
 ```
 
-### 2. Edit the 3 config lines at the top of install.ps1
+### 2. Edit the 3 lines at the top of install.ps1
 
 ```powershell
 $SUBDOMAIN  = "files.yourdomain.com"   # your public URL
@@ -39,24 +40,24 @@ $ADMIN_PASS = "ChangeMe@123"           # use a strong password
 
 ### 3. Right-click install.ps1 → Run with PowerShell (as Administrator)
 
-The script handles everything:
-- Installs Docker Desktop if missing (handles restart automatically)
-- Pulls and starts Nextcloud + MariaDB containers
-- Removes any existing FileBrowser setup
+The script handles everything automatically:
+- Installs PHP, MariaDB, Caddy via winget
+- Configures PHP and the database
+- Downloads and installs Nextcloud
+- Maps all current drives as External Storage
+- Configures Caddy as the web server
 - Reuses existing Cloudflare Tunnel or creates a new one
-- Updates your Cloudflare DNS record (prompts for API token)
-- Registers all startup tasks
+- Updates your DNS record (auto via API token, or prints the CNAME to add manually)
+- Registers all startup tasks so everything restarts on reboot
+- Starts the USB watcher (detects new drives within 10 seconds)
 
-If a restart is needed (first-time Docker/WSL2 setup), the script auto-resumes after you log back in.
+### 4. DNS record (Cloudflare auto or any provider manually)
 
-### 4. Cloudflare API token (optional but recommended)
+When prompted, enter a Cloudflare API token to update DNS automatically:
+- **dash.cloudflare.com → My Profile → API Tokens → Edit zone DNS** template
+- Permissions: Zone:Read + Zone:DNS:Edit
 
-When prompted, create a token at **dash.cloudflare.com → My Profile → API Tokens**:
-- Template: **Edit zone DNS**
-- Permissions: **Zone:Read** + **Zone:DNS:Edit**
-- Zone: your domain only
-
-If you skip this, add the CNAME manually in the Cloudflare dashboard (the script prints exactly what to add).
+Or press Enter to skip — the script prints the exact CNAME to add at any DNS provider.
 
 ## File locations
 
@@ -64,45 +65,51 @@ If you skip this, add the CNAME manually in the Cloudflare dashboard (the script
 C:\CloudDrive\
   config.yml          Cloudflare Tunnel config
   tunnel.json         Tunnel credentials (keep secret)
-  drive-watcher.ps1   Auto-maps new drives every 5 min
+  Caddyfile           Web server config
+  db.env              Database password (keep secret)
+  usb-watcher.ps1     USB drive detection daemon
+  known-drives.json   USB watcher state file
+  usb-watcher.log     USB watcher log
 
-C:\CloudDrive\nextcloud\
-  docker-compose.yml  Nextcloud + MariaDB container config
-
-D:\NextcloudData\     Nextcloud files (user uploads, config)
-D:\NextcloudDB\       MariaDB database files
-
-C:\CloudRoot\
-  C-Drive\            Junction -> C:\
-  D-Drive\            Junction -> D:\
-  (new drives appear here automatically)
+C:\Nextcloud\         Nextcloud app files (PHP)
+D:\NextcloudData\     User files and uploads
 ```
 
-## Adding a drive manually
+## USB plug and play
+
+Plug in any USB drive — it appears in Nextcloud within 10 seconds.
+No restart needed. The USB watcher runs continuously in the background.
+
+## Startup tasks (auto-registered by install.ps1)
+
+| Task | What it runs |
+|------|-------------|
+| PhpCgi | PHP FastCGI server (port 9123) |
+| CaddyServer | Caddy web server (port 8080) |
+| CloudflaredTunnel | Cloudflare Tunnel to your domain |
+| UsbWatcher | Detects drive changes every 10 sec |
+
+## Managing the services
 
 ```powershell
-# Run as Administrator
-mklink /J "C:\CloudRoot\E-Drive" "E:\"
-```
+# Check status
+schtasks /query /tn "CaddyServer" /fo list
+schtasks /query /tn "CloudflaredTunnel" /fo list
 
-Shows up in Nextcloud within seconds — no restart needed.
+# Restart a service
+schtasks /end /tn "CaddyServer"; schtasks /run /tn "CaddyServer"
 
-## Managing containers
+# View USB watcher log
+Get-Content C:\CloudDrive\usb-watcher.log -Tail 20
 
-```powershell
-cd C:\CloudDrive\nextcloud
-
-docker compose ps          # check status
-docker compose restart     # restart both containers
-docker compose down        # stop
-docker compose up -d       # start
-docker compose logs -f     # view logs
+# Run occ commands (Nextcloud admin CLI)
+php C:\Nextcloud\occ status
+php C:\Nextcloud\occ files_external:list
 ```
 
 ## Updating Nextcloud
 
 ```powershell
-cd C:\CloudDrive\nextcloud
-docker compose pull
-docker compose up -d
+# Download latest zip, extract to C:\Nextcloud, then:
+php C:\Nextcloud\occ upgrade
 ```
