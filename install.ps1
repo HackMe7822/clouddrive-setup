@@ -1,4 +1,4 @@
-# ================================================================
+﻿# ================================================================
 #  CloudDrive - Native Windows Installer
 #  Nextcloud on PHP + MariaDB + Caddy, no Docker needed
 #  USB drives appear instantly - no container restarts
@@ -73,16 +73,16 @@ if (-not $phpExe) {
 }
 if (-not $phpExe) {
     # Fallback: download directly
-    Write-Host "  PHP not found via winget — downloading directly..." -ForegroundColor Yellow
+    Write-Host "  PHP not found via winget - downloading directly..." -ForegroundColor Yellow
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $phpZip = "$INSTALL_DIR\php.zip"
     Invoke-WebRequest "https://windows.php.net/downloads/releases/php-8.3.32-Win32-vs16-x64.zip" -OutFile $phpZip -UseBasicParsing
     New-Item -ItemType Directory -Force -Path "C:\php" | Out-Null
     Expand-Archive -Path $phpZip -DestinationPath "C:\php" -Force
     Remove-Item $phpZip -Force
-    $phpExe = "C:\php\php.exe"
-    $env:PATH = "C:\php;$env:PATH"
-    [System.Environment]::SetEnvironmentVariable("PATH", "C:\php;" + [System.Environment]::GetEnvironmentVariable("PATH","Machine"), "Machine")
+    $phpExe = 'C:\php\php.exe'
+    $env:PATH = 'C:\php;' + $env:PATH
+    [System.Environment]::SetEnvironmentVariable('PATH', 'C:\php;' + [System.Environment]::GetEnvironmentVariable('PATH','Machine'), 'Machine')
 }
 if (-not $phpExe) { Write-Host "PHP install failed. Check internet and re-run." -ForegroundColor Red; exit 1 }
 
@@ -148,10 +148,12 @@ Start-Sleep 3
 $chars  = (65..90) + (97..122) + (48..57)
 $dbPass = -join ($chars | Get-Random -Count 24 | ForEach-Object { [char]$_ })
 
-# Create database and user
-$sqlCmds = "CREATE DATABASE IF NOT EXISTS nextcloud CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci; CREATE USER IF NOT EXISTS 'nextcloud'@'localhost' IDENTIFIED BY '$dbPass'; GRANT ALL PRIVILEGES ON nextcloud.* TO 'nextcloud'@'localhost'; FLUSH PRIVILEGES;"
-& $mysqlExe -u root --execute="$sqlCmds" 2>&1 | Out-Null
-Write-Host "  Database 'nextcloud' created." -ForegroundColor Green
+# Create database and user (split into separate statements to avoid @' here-string trigger)
+& $mysqlExe -u root --execute="CREATE DATABASE IF NOT EXISTS nextcloud CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;" 2>&1 | Out-Null
+& $mysqlExe -u root --execute="CREATE USER IF NOT EXISTS nextcloud@localhost IDENTIFIED BY '$dbPass';" 2>&1 | Out-Null
+& $mysqlExe -u root --execute="GRANT ALL PRIVILEGES ON nextcloud.* TO nextcloud@localhost;" 2>&1 | Out-Null
+& $mysqlExe -u root --execute="FLUSH PRIVILEGES;" 2>&1 | Out-Null
+Write-Host "  Database nextcloud created." -ForegroundColor Green
 
 # Save DB password
 "DB_PASS=$dbPass" | Set-Content "$INSTALL_DIR\db.env" -Encoding UTF8
@@ -276,7 +278,7 @@ if (Test-Path $localCred) {
     $tunnelId = (Get-Content $localCred -Raw | ConvertFrom-Json).TunnelID
     Write-Host "  Using existing tunnel from $localCred : $tunnelId" -ForegroundColor Green
 } else {
-    # Look for tunnel credentials in cloudflared dir — prefer any that matches current config.yml
+    # Look for tunnel credentials in cloudflared dir - prefer any that matches current config.yml
     $existingConfig = if (Test-Path "$INSTALL_DIR\config.yml") { Get-Content "$INSTALL_DIR\config.yml" -Raw } else { "" }
     $credJson = $null
     if ($existingConfig -match "tunnel:\s*([a-f0-9-]{36})") {
