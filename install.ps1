@@ -8,10 +8,10 @@
 #
 #  EDIT THESE BEFORE RUNNING:
 # ================================================================
-$SUBDOMAIN   = "files.yourdomain.com"   # your public URL
+$SUBDOMAIN   = "files.creationsit.com"  # your public URL
 $ADMIN_USER  = "admin"
 $ADMIN_PASS  = "ChangeMe@123"           # change after install
-$NC_DATA_DIR = "D:\NextcloudData"       # where user files are stored
+$NC_DATA_DIR = "D:\NCData"              # where user files are stored
 $NC_DIR      = "C:\Nextcloud"           # Nextcloud app files
 $NC_PORT     = 8080
 $PHP_PORT    = 9123                     # internal PHP-CGI port
@@ -41,20 +41,51 @@ New-Item -ItemType Directory -Force -Path $NC_DATA_DIR | Out-Null
 # ================================================================
 Write-Step 1 7 "Installing PHP, MariaDB, Caddy..."
 
-winget install PHP.PHP          --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
-winget install MariaDB.Server   --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
-winget install CaddyServer.Caddy --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+function Install-IfMissing($cmd, $wingetId, $label) {
+    $found = Get-Command $cmd -ErrorAction SilentlyContinue
+    if ($found) { Write-Host "  $label already installed: $($found.Source)" -ForegroundColor Gray; return }
+    Write-Host "  Installing $label..." -ForegroundColor Gray
+    winget install $wingetId --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+}
 
-# Refresh PATH
-$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
+Install-IfMissing "caddy"  "CaddyServer.Caddy" "Caddy"
+Install-IfMissing "mysql"  "MariaDB.Server"    "MariaDB"
 
-# Find PHP
+# PHP: check multiple package IDs since winget changed the name
 $phpExe = (Get-Command php -ErrorAction SilentlyContinue).Source
 if (-not $phpExe) {
-    $phpExe = @("C:\php\php.exe","C:\PHP\php.exe","C:\Program Files\PHP\php.exe") |
-        Where-Object { Test-Path $_ } | Select-Object -First 1
+    Write-Host "  Installing PHP 8.3..." -ForegroundColor Gray
+    winget install PHP.PHP.8.3 --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
 }
-if (-not $phpExe) { Write-Host "PHP not found after install. Please install PHP manually and re-run." -ForegroundColor Red; pause; exit 1 }
+
+# Refresh PATH so winget-installed binaries are visible
+$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
+
+# Locate PHP (winget puts it in AppData\Local\Microsoft\WinGet\Links or the install dir)
+$phpExe = (Get-Command php -ErrorAction SilentlyContinue).Source
+if (-not $phpExe) {
+    $phpExe = @(
+        "C:\php\php.exe",
+        "C:\PHP\php.exe",
+        "C:\Program Files\PHP\php.exe",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links\php.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if (-not $phpExe) {
+    # Fallback: download directly
+    Write-Host "  PHP not found via winget — downloading directly..." -ForegroundColor Yellow
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $phpZip = "$INSTALL_DIR\php.zip"
+    Invoke-WebRequest "https://windows.php.net/downloads/releases/php-8.3.32-Win32-vs16-x64.zip" -OutFile $phpZip -UseBasicParsing
+    New-Item -ItemType Directory -Force -Path "C:\php" | Out-Null
+    Expand-Archive -Path $phpZip -DestinationPath "C:\php" -Force
+    Remove-Item $phpZip -Force
+    $phpExe = "C:\php\php.exe"
+    $env:PATH = "C:\php;$env:PATH"
+    [System.Environment]::SetEnvironmentVariable("PATH", "C:\php;" + [System.Environment]::GetEnvironmentVariable("PATH","Machine"), "Machine")
+}
+if (-not $phpExe) { Write-Host "PHP install failed. Check internet and re-run." -ForegroundColor Red; exit 1 }
+
 $phpDir    = Split-Path $phpExe
 $phpCgiExe = Join-Path $phpDir "php-cgi.exe"
 $phpIni    = Join-Path $phpDir "php.ini"
@@ -62,11 +93,11 @@ Write-Host "  PHP: $phpExe" -ForegroundColor Green
 
 # Configure php.ini
 if (Test-Path "$phpDir\php.ini-production") { Copy-Item "$phpDir\php.ini-production" $phpIni -Force }
-$extensions = @("curl","gd","intl","mbstring","openssl","pdo_mysql","zip","fileinfo","bcmath","exif","gmp","imagick","ldap")
+elseif (Test-Path "$phpDir\php.ini-development") { Copy-Item "$phpDir\php.ini-development" $phpIni -Force }
+$extensions = @("curl","gd","intl","mbstring","openssl","pdo_mysql","zip","fileinfo","bcmath","exif","gmp")
 foreach ($ext in $extensions) {
     (Get-Content $phpIni) -replace ";extension=$ext", "extension=$ext" | Set-Content $phpIni
 }
-# Set required php.ini values
 (Get-Content $phpIni) -replace "^;?date.timezone =.*", "date.timezone = Asia/Kolkata" `
                       -replace "^;?memory_limit =.*", "memory_limit = 512M" `
                       -replace "^;?upload_max_filesize =.*", "upload_max_filesize = 10G" `
@@ -76,19 +107,21 @@ foreach ($ext in $extensions) {
 Write-Host "  PHP configured." -ForegroundColor Green
 
 # Find Caddy
+$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
 $caddyExe = (Get-Command caddy -ErrorAction SilentlyContinue).Source
 if (-not $caddyExe) {
-    $caddyExe = @("C:\Program Files\Caddy\caddy.exe","C:\ProgramData\caddy\caddy.exe") |
-        Where-Object { Test-Path $_ } | Select-Object -First 1
+    $caddyExe = @(
+        "C:\Program Files\Caddy\caddy.exe",
+        "C:\ProgramData\caddy\caddy.exe",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links\caddy.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
 Write-Host "  Caddy: $caddyExe" -ForegroundColor Green
 
 # Find MariaDB mysql
 $mysqlExe = Get-ChildItem "C:\Program Files\MariaDB*\bin\mysql.exe" -Recurse -ErrorAction SilentlyContinue |
     Select-Object -First 1 -ExpandProperty FullName
-if (-not $mysqlExe) {
-    $mysqlExe = (Get-Command mysql -ErrorAction SilentlyContinue).Source
-}
+if (-not $mysqlExe) { $mysqlExe = (Get-Command mysql -ErrorAction SilentlyContinue).Source }
 Write-Host "  MariaDB mysql: $mysqlExe" -ForegroundColor Green
 
 # ================================================================
@@ -177,7 +210,7 @@ foreach ($drive in $drives) {
     $letter = $drive.Name
     $path   = $drive.Root -replace "\\$", ""
     & $phpExe "$NC_DIR\occ" files_external:create "${letter}-Drive" local null::null --config "datadir=$path" 2>&1 | Out-Null
-    Write-Host "  Added $letter: as external storage" -ForegroundColor Green
+    Write-Host "  Added $($letter): as external storage" -ForegroundColor Green
 }
 
 # Save known drives for USB watcher
@@ -236,20 +269,35 @@ if (-not (Test-Path "$CF_DIR\cert.pem")) {
     & $cfBin tunnel login
 }
 
-$credJson  = Get-ChildItem $CF_DIR -Filter "*.json" -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -ne "cert.json" } | Select-Object -First 1
 $localCred = "$INSTALL_DIR\tunnel.json"
 
-if ($credJson) {
-    $tunnelId = $credJson.BaseName
-    if (-not (Test-Path $localCred)) { Copy-Item $credJson.FullName $localCred -Force }
-    Write-Host "  Using existing tunnel: $tunnelId" -ForegroundColor Green
+# Use existing tunnel.json in $INSTALL_DIR if present (already configured)
+if (Test-Path $localCred) {
+    $tunnelId = (Get-Content $localCred -Raw | ConvertFrom-Json).TunnelID
+    Write-Host "  Using existing tunnel from $localCred : $tunnelId" -ForegroundColor Green
 } else {
-    & $cfBin tunnel create files-drive 2>&1 | Out-Null
-    $credJson  = Get-ChildItem $CF_DIR -Filter "*.json" | Where-Object { $_.Name -ne "cert.json" } | Select-Object -First 1
-    $tunnelId  = $credJson.BaseName
-    Copy-Item $credJson.FullName $localCred -Force
-    Write-Host "  Created tunnel: $tunnelId" -ForegroundColor Green
+    # Look for tunnel credentials in cloudflared dir — prefer any that matches current config.yml
+    $existingConfig = if (Test-Path "$INSTALL_DIR\config.yml") { Get-Content "$INSTALL_DIR\config.yml" -Raw } else { "" }
+    $credJson = $null
+    if ($existingConfig -match "tunnel:\s*([a-f0-9-]{36})") {
+        $cfgTunnelId = $Matches[1]
+        $credJson = Get-ChildItem $CF_DIR -Filter "$cfgTunnelId.json" -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if (-not $credJson) {
+        $credJson = Get-ChildItem $CF_DIR -Filter "*.json" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "cert.json" } | Select-Object -Last 1
+    }
+    if ($credJson) {
+        $tunnelId = $credJson.BaseName
+        Copy-Item $credJson.FullName $localCred -Force
+        Write-Host "  Using existing tunnel: $tunnelId" -ForegroundColor Green
+    } else {
+        & $cfBin tunnel create files-drive 2>&1 | Out-Null
+        $credJson  = Get-ChildItem $CF_DIR -Filter "*.json" | Where-Object { $_.Name -ne "cert.json" } | Select-Object -Last 1
+        $tunnelId  = $credJson.BaseName
+        Copy-Item $credJson.FullName $localCred -Force
+        Write-Host "  Created tunnel: $tunnelId" -ForegroundColor Green
+    }
 }
 
 $configPath = "$INSTALL_DIR\config.yml"
@@ -269,9 +317,10 @@ $subdName = ($SUBDOMAIN -split "\.")[0]
 $cname    = "$tunnelId.cfargotunnel.com"
 
 Write-Host ""
-Write-Host "  Cloudflare API token for auto DNS update (or Enter to skip):" -ForegroundColor Cyan
+Write-Host "  Cloudflare API token for auto DNS update (leave blank to skip):" -ForegroundColor Cyan
 Write-Host "  dash.cloudflare.com -> My Profile -> API Tokens -> Edit zone DNS template" -ForegroundColor Gray
-$cfToken = Read-Host "  Token"
+# Set $CF_API_TOKEN before running to skip this prompt, or leave empty for manual DNS
+$cfToken = if ($CF_API_TOKEN) { $CF_API_TOKEN } else { "" }
 
 if ($cfToken.Trim() -ne "") {
     $h = @{ "Authorization" = "Bearer $($cfToken.Trim())"; "Content-Type" = "application/json" }
