@@ -1,4 +1,4 @@
-﻿# ================================================================
+# ================================================================
 #  CloudDrive - Native Windows Installer
 #  Nextcloud on PHP + MariaDB + Caddy, no Docker needed
 #  USB drives appear instantly - no container restarts
@@ -39,7 +39,7 @@ New-Item -ItemType Directory -Force -Path $NC_DATA_DIR | Out-Null
 # ================================================================
 # STEP 1 - Install PHP, MariaDB, Caddy
 # ================================================================
-Write-Step 1 7 "Installing PHP, MariaDB, Caddy..."
+Write-Step 1 8 "Installing PHP, MariaDB, Caddy..."
 
 function Install-IfMissing($cmd, $wingetId, $label) {
     $found = Get-Command $cmd -ErrorAction SilentlyContinue
@@ -94,16 +94,41 @@ Write-Host "  PHP: $phpExe" -ForegroundColor Green
 # Configure php.ini
 if (Test-Path "$phpDir\php.ini-production") { Copy-Item "$phpDir\php.ini-production" $phpIni -Force }
 elseif (Test-Path "$phpDir\php.ini-development") { Copy-Item "$phpDir\php.ini-development" $phpIni -Force }
-$extensions = @("curl","gd","intl","mbstring","openssl","pdo_mysql","zip","fileinfo","bcmath","exif","gmp")
+
+$extensions = @("curl","gd","intl","mbstring","openssl","pdo_mysql","zip","fileinfo","bcmath","exif","gmp","sodium")
 foreach ($ext in $extensions) {
     (Get-Content $phpIni) -replace ";extension=$ext", "extension=$ext" | Set-Content $phpIni
 }
+
+# Set extension_dir to actual PHP install location (winget uses a non-standard path)
+$extDir = Join-Path $phpDir "ext"
+if (Test-Path $extDir) {
+    $escaped = $extDir -replace "\\", "\\"
+    $ini = Get-Content $phpIni
+    if ($ini -match "^;?extension_dir") {
+        $ini = $ini -replace "^;?extension_dir\s*=.*", "extension_dir = `"$extDir`""
+    } else {
+        $ini += "`nextension_dir = `"$extDir`""
+    }
+    $ini | Set-Content $phpIni
+}
+
 (Get-Content $phpIni) -replace "^;?date.timezone =.*", "date.timezone = Asia/Kolkata" `
                       -replace "^;?memory_limit =.*", "memory_limit = 512M" `
                       -replace "^;?upload_max_filesize =.*", "upload_max_filesize = 10G" `
                       -replace "^;?post_max_size =.*", "post_max_size = 10G" `
                       -replace "^;?max_execution_time =.*", "max_execution_time = 3600" `
-                      -replace "^;?output_buffering =.*", "output_buffering = Off" | Set-Content $phpIni
+                      -replace "^;?output_buffering =.*", "output_buffering = Off" `
+                      -replace "^;?default_socket_timeout =.*", "default_socket_timeout = 5" | Set-Content $phpIni
+
+# Ensure default_socket_timeout is present (may not exist in ini)
+if (-not (Get-Content $phpIni | Select-String "^default_socket_timeout")) {
+    Add-Content $phpIni "`ndefault_socket_timeout = 5"
+}
+# Disable OPcache CLI to avoid stale class caches during occ runs
+if (-not (Get-Content $phpIni | Select-String "^opcache.enable_cli")) {
+    Add-Content $phpIni "`nopcache.enable_cli=0"
+}
 Write-Host "  PHP configured." -ForegroundColor Green
 
 # Find Caddy
@@ -127,7 +152,7 @@ Write-Host "  MariaDB mysql: $mysqlExe" -ForegroundColor Green
 # ================================================================
 # STEP 2 - Database setup
 # ================================================================
-Write-Step 2 7 "Setting up database..."
+Write-Step 2 8 "Setting up database..."
 
 # Start MariaDB service
 $dbService = Get-Service -Name "MySQL*","MariaDB*" -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -148,10 +173,12 @@ Start-Sleep 3
 $chars  = (65..90) + (97..122) + (48..57)
 $dbPass = -join ($chars | Get-Random -Count 24 | ForEach-Object { [char]$_ })
 
-# Create database and user (split into separate statements to avoid @' here-string trigger)
+# Create database and user - both @localhost and @127.0.0.1 are needed on Windows
 & $mysqlExe -u root --execute="CREATE DATABASE IF NOT EXISTS nextcloud CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;" 2>&1 | Out-Null
-& $mysqlExe -u root --execute="CREATE USER IF NOT EXISTS nextcloud@localhost IDENTIFIED BY '$dbPass';" 2>&1 | Out-Null
-& $mysqlExe -u root --execute="GRANT ALL PRIVILEGES ON nextcloud.* TO nextcloud@localhost;" 2>&1 | Out-Null
+& $mysqlExe -u root --execute="CREATE USER IF NOT EXISTS 'nextcloud'@'localhost' IDENTIFIED BY '$dbPass';" 2>&1 | Out-Null
+& $mysqlExe -u root --execute="CREATE USER IF NOT EXISTS 'nextcloud'@'127.0.0.1' IDENTIFIED BY '$dbPass';" 2>&1 | Out-Null
+& $mysqlExe -u root --execute="GRANT ALL PRIVILEGES ON nextcloud.* TO 'nextcloud'@'localhost';" 2>&1 | Out-Null
+& $mysqlExe -u root --execute="GRANT ALL PRIVILEGES ON nextcloud.* TO 'nextcloud'@'127.0.0.1';" 2>&1 | Out-Null
 & $mysqlExe -u root --execute="FLUSH PRIVILEGES;" 2>&1 | Out-Null
 Write-Host "  Database nextcloud created." -ForegroundColor Green
 
@@ -161,7 +188,7 @@ Write-Host "  Database nextcloud created." -ForegroundColor Green
 # ================================================================
 # STEP 3 - Download and install Nextcloud
 # ================================================================
-Write-Step 3 7 "Downloading Nextcloud..."
+Write-Step 3 8 "Downloading Nextcloud..."
 
 if (Test-Path "$NC_DIR\occ") {
     Write-Host "  Nextcloud already installed at $NC_DIR, skipping download." -ForegroundColor Gray
@@ -170,9 +197,18 @@ if (Test-Path "$NC_DIR\occ") {
     Write-Host "  Downloading latest Nextcloud (~200MB)..." -ForegroundColor Gray
     Invoke-WebRequest -Uri "https://download.nextcloud.com/server/releases/latest.zip" -OutFile $ncZip -UseBasicParsing
     Write-Host "  Extracting..." -ForegroundColor Gray
+    # Add Defender exclusions before extracting to prevent file locking
+    Add-MpPreference -ExclusionPath $NC_DIR -ErrorAction SilentlyContinue
+    Add-MpPreference -ExclusionPath $NC_DATA_DIR -ErrorAction SilentlyContinue
+    Add-MpPreference -ExclusionPath $INSTALL_DIR -ErrorAction SilentlyContinue
     Expand-Archive -Path $ncZip -DestinationPath "C:\" -Force
     Remove-Item $ncZip -Force
     Write-Host "  Nextcloud extracted to $NC_DIR" -ForegroundColor Green
+}
+
+# Create the .ncdata marker file required by Nextcloud
+if (-not (Test-Path "$NC_DATA_DIR\.ncdata")) {
+    "# Nextcloud data directory" | Set-Content "$NC_DATA_DIR\.ncdata" -Encoding UTF8
 }
 
 # Set folder permissions for www-data equivalent (running as SYSTEM)
@@ -180,6 +216,103 @@ $acl = Get-Acl $NC_DIR
 $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("SYSTEM","FullControl","ContainerInherit,ObjectInherit","None","Allow")
 $acl.SetAccessRule($rule)
 Set-Acl $NC_DIR $acl
+
+# ================================================================
+# STEP 4 - Apply Windows compatibility patches
+# ================================================================
+Write-Step 4 8 "Applying Windows compatibility patches..."
+
+# Patch 1: occ - skip dropPrivileges() on Windows (posix_getuid() not available)
+$occPath = "$NC_DIR\occ"
+$occContent = Get-Content $occPath -Raw -Encoding UTF8
+if ($occContent -notmatch "PHP_OS_FAMILY.*Windows.*dropPrivileges") {
+    $occContent = $occContent -replace "(function dropPrivileges\(\): void \{)", @'
+$1
+    if (PHP_OS_FAMILY === 'Windows') {
+        return;
+    }
+'@
+    [System.IO.File]::WriteAllText($occPath, $occContent, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  occ: patched dropPrivileges for Windows" -ForegroundColor Green
+}
+
+# Patch 2: console.php - add POSIX stubs and fix fileowner check
+$consolePath = "$NC_DIR\console.php"
+$consoleContent = Get-Content $consolePath -Raw -Encoding UTF8
+if ($consoleContent -notmatch "posix_getuid.*return 0") {
+    $stub = @'
+// Windows compatibility: stub POSIX functions not available on Windows PHP
+if (PHP_OS_FAMILY === 'Windows') {
+	if (!function_exists('posix_getuid')) {
+		function posix_getuid(): int { return 0; }
+	}
+	if (!function_exists('posix_getpwuid')) {
+		function posix_getpwuid(int $uid): array|false { return ['name' => 'system', 'uid' => 0, 'gid' => 0, 'dir' => 'C:\\', 'shell' => '']; }
+	}
+	if (!function_exists('posix_setuid')) {
+		function posix_setuid(int $uid): bool { return true; }
+	}
+	if (!function_exists('posix_setgid')) {
+		function posix_setgid(int $gid): bool { return true; }
+	}
+}
+
+'@
+    $consoleContent = $consoleContent -replace "(define\('OC_CONSOLE', 1\);)", "$1`n`n$stub"
+    # Fix fileowner() call to not crash on missing file and skip on Windows
+    $consoleContent = $consoleContent -replace '\$configUser = fileowner\(\$configFile\);', '$configUser = file_exists($configFile) ? fileowner($configFile) : $user;'
+    $consoleContent = $consoleContent -replace '(if \(\$configUser !== false && \$user !== \$configUser\))', '$1 && PHP_OS_FAMILY !== ''Windows'''
+    [System.IO.File]::WriteAllText($consolePath, $consoleContent, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  console.php: patched POSIX stubs and fileowner check" -ForegroundColor Green
+}
+
+# Patch 3: MigrationService.php - fix regex to accept both / and \ as path separators
+$migPath = "$NC_DIR\lib\private\DB\MigrationService.php"
+$migContent = Get-Content $migPath -Raw -Encoding UTF8
+if ($migContent -match "#\^\.\+\\\\/Version") {
+    Write-Host "  MigrationService.php: already patched" -ForegroundColor Gray
+} else {
+    $migContent = $migContent -replace "#\^\.\+\\\\/Version\[^\\\\/\]\{1,255\}\\\\.php\\\$#i", "#^.+[\\\\/]Version[^\\\\/]{1,255}\.php$#i"
+    # More robust search and replace
+    $migContent = $migContent -replace [regex]::Escape("#^.+\/Version[^\/]{1,255}\.php$#i"), "#^.+[\\\\/]Version[^\\\\/]{1,255}\.php\$#i"
+    [System.IO.File]::WriteAllText($migPath, $migContent, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  MigrationService.php: patched path separator regex" -ForegroundColor Green
+}
+
+# Patch 4: OC_Util.php - accept Windows absolute paths like D:\NCData
+$utilPath = "$NC_DIR\lib\private\legacy\OC_Util.php"
+$utilContent = Get-Content $utilPath -Raw -Encoding UTF8
+if ($utilContent -notmatch "A-Za-z.*:\[/") {
+    $utilContent = $utilContent -replace 'if \(\$dataDirectory\[0\] !== .\/.\)', 'if ($dataDirectory[0] !== ''/'' && !preg_match(''#^[A-Za-z]:[/\\\\\\\\ ]#'', $dataDirectory))'
+    [System.IO.File]::WriteAllText($utilPath, $utilContent, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  OC_Util.php: patched Windows path check" -ForegroundColor Green
+}
+
+# Patch 5: Manager.php - fix infinite loop on Windows paths in find()
+$mgrPath = "$NC_DIR\lib\private\Files\Mount\Manager.php"
+$mgrContent = Get-Content $mgrPath -Raw -Encoding UTF8
+if ($mgrContent -notmatch '\$prev = \$current') {
+    $mgrContent = $mgrContent -replace '(\s+)\$current = dirname\(\$current\);\r?\n(\s+)if \(\$current === \x27\.\x27 \|\| \$current === \x27\/\x27\)', '$1$prev = $current;
+$1$current = dirname($current);
+$2if ($current === ''.'' || $current === ''/'' || $current === ''\\'' || $current === $prev)'
+    [System.IO.File]::WriteAllText($mgrPath, $mgrContent, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  Manager.php: patched infinite loop on Windows paths" -ForegroundColor Green
+}
+
+# Patch 6: Local.php - fix realpath() returning backslashes causing false symlink errors
+$localPath = "$NC_DIR\lib\private\Files\Storage\Local.php"
+$localContent = Get-Content $localPath -Raw -Encoding UTF8
+if ($localContent -notmatch "str_replace\(.*realPath") {
+    # Fix in constructor
+    $localContent = $localContent -replace '(\$realPath = realpath\(\$this->datadir\) \?: \$this->datadir;\s*\n\s*)(\$this->realDataDir)', '$1$realPath = str_replace(''\'', ''/'', $realPath);
+		$2'
+    # Fix in getSourcePath()
+    $localContent = $localContent -replace '(if \(\$realPath\) \{\s*\n\s*)\$realPath = \$realPath \. \x27\/\x27;', '$1$realPath = str_replace(''\'', ''/'', $realPath) . ''/''};'
+    [System.IO.File]::WriteAllText($localPath, $localContent, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  Local.php: patched realpath backslash normalization" -ForegroundColor Green
+}
+
+Write-Host "  Windows patches applied." -ForegroundColor Green
 
 Write-Host "  Installing Nextcloud (this takes ~2 minutes)..." -ForegroundColor Gray
 & $phpExe "$NC_DIR\occ" maintenance:install `
@@ -197,12 +330,19 @@ Write-Host "  Installing Nextcloud (this takes ~2 minutes)..." -ForegroundColor 
 & $phpExe "$NC_DIR\occ" config:system:set trusted_domains 2 --value="127.0.0.1"
 & $phpExe "$NC_DIR\occ" config:system:set overwrite.cli.url --value="https://$SUBDOMAIN"
 & $phpExe "$NC_DIR\occ" config:system:set overwriteprotocol --value="https"
+& $phpExe "$NC_DIR\occ" config:system:set trusted_proxies 0 --value="127.0.0.1"
+& $phpExe "$NC_DIR\occ" config:system:set check_data_directory_permissions --value=false --type=boolean
+& $phpExe "$NC_DIR\occ" config:system:set has_internet_connection --value=false --type=boolean
+& $phpExe "$NC_DIR\occ" config:system:set connectivity_check_domains --value="" --type=json
+& $phpExe "$NC_DIR\occ" config:system:set updatechecker --value=false --type=boolean
+& $phpExe "$NC_DIR\occ" config:system:set check_for_working_wellknown_setup --value=false --type=boolean
+& $phpExe "$NC_DIR\occ" app:disable notifications 2>&1 | Out-Null
 Write-Host "  Nextcloud installed." -ForegroundColor Green
 
 # ================================================================
-# STEP 4 - External Storage (all drives, instant USB support)
+# STEP 5 - External Storage (all drives, instant USB support)
 # ================================================================
-Write-Step 4 7 "Configuring drive access..."
+Write-Step 5 8 "Configuring drive access..."
 
 & $phpExe "$NC_DIR\occ" app:enable files_external 2>&1 | Out-Null
 & $phpExe "$NC_DIR\occ" config:app:set core enable_external_storage --value=yes 2>&1 | Out-Null
@@ -225,9 +365,9 @@ if (Test-Path "$PSScriptRoot\usb-watcher.ps1") {
 }
 
 # ================================================================
-# STEP 5 - Caddy web server config
+# STEP 6 - Caddy web server config
 # ================================================================
-Write-Step 5 7 "Configuring web server..."
+Write-Step 6 8 "Configuring web server..."
 
 $caddyFile = "$INSTALL_DIR\Caddyfile"
 @"
@@ -239,9 +379,7 @@ $caddyFile = "$INSTALL_DIR\Caddyfile"
 
     encode gzip
 
-    php_fastcgi localhost:$PHP_PORT {
-        env PATH $phpDir
-    }
+    php_fastcgi 127.0.0.1:$PHP_PORT
 
     file_server
 
@@ -255,9 +393,9 @@ $caddyFile = "$INSTALL_DIR\Caddyfile"
 Write-Host "  Caddyfile written." -ForegroundColor Green
 
 # ================================================================
-# STEP 6 - Cloudflare Tunnel
+# STEP 7 - Cloudflare Tunnel
 # ================================================================
-Write-Step 6 7 "Cloudflare Tunnel..."
+Write-Step 7 8 "Cloudflare Tunnel..."
 
 $cfInstalled = Get-Command cloudflared -ErrorAction SilentlyContinue
 if (-not $cfInstalled) {
@@ -347,52 +485,45 @@ if ($cfToken.Trim() -ne "") {
 }
 
 # ================================================================
-# STEP 7 - Register all startup tasks
+# STEP 8 - Register all startup tasks
 # ================================================================
-Write-Step 7 7 "Registering startup tasks..."
+Write-Step 8 8 "Registering startup tasks..."
 
-# PHP-CGI task (FastCGI server for Caddy)
-schtasks /delete /tn "PhpCgi"    /f 2>$null
-schtasks /create /tn "PhpCgi" `
-    /tr "`"$phpCgiExe`" -b 127.0.0.1:$PHP_PORT" `
-    /sc ONSTART /ru SYSTEM /rl HIGHEST /f | Out-Null
-schtasks /run /tn "PhpCgi" | Out-Null
+$trigger  = New-ScheduledTaskTrigger -AtLogOn
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew
+
+# PHP-CGI task - pass -c to use the correct php.ini (winget puts PHP in a non-standard path)
+$phpAction = New-ScheduledTaskAction -Execute $phpCgiExe -Argument "-b 127.0.0.1:$PHP_PORT -c `"$phpIni`""
+Register-ScheduledTask -TaskName "CloudDrive-PHPCGI" -Action $phpAction -Trigger $trigger -Settings $settings -RunLevel Highest -Force | Out-Null
+Start-ScheduledTask -TaskName "CloudDrive-PHPCGI" -ErrorAction SilentlyContinue
 Write-Host "  PHP-CGI task registered." -ForegroundColor Green
 
 # Caddy task
-schtasks /delete /tn "CaddyServer" /f 2>$null
-schtasks /create /tn "CaddyServer" `
-    /tr "`"$caddyExe`" run --config `"$caddyFile`"" `
-    /sc ONSTART /ru SYSTEM /rl HIGHEST /f | Out-Null
-schtasks /run /tn "CaddyServer" | Out-Null
+$caddyAction = New-ScheduledTaskAction -Execute $caddyExe -Argument "run --config `"$caddyFile`"" -WorkingDirectory $INSTALL_DIR
+Register-ScheduledTask -TaskName "CloudDrive-Caddy" -Action $caddyAction -Trigger $trigger -Settings $settings -RunLevel Highest -Force | Out-Null
+Start-ScheduledTask -TaskName "CloudDrive-Caddy" -ErrorAction SilentlyContinue
 Write-Host "  Caddy task registered." -ForegroundColor Green
 
-# Cloudflared task
-Unregister-ScheduledTask -TaskName "CloudflaredTunnel" -Confirm:$false -ErrorAction SilentlyContinue
-$cfAction    = New-ScheduledTaskAction -Execute $cfBin -Argument "tunnel --config `"$configPath`" run"
-$cfTrigger   = New-ScheduledTaskTrigger -AtStartup
-$cfSettings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 0) -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1)
-$cfPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-Register-ScheduledTask -TaskName "CloudflaredTunnel" -Action $cfAction -Trigger $cfTrigger -Settings $cfSettings -Principal $cfPrincipal | Out-Null
-Start-ScheduledTask -TaskName "CloudflaredTunnel" -ErrorAction SilentlyContinue
-Write-Host "  Cloudflared task registered." -ForegroundColor Green
+# Cloudflared tunnel task
+$cfAction   = New-ScheduledTaskAction -Execute $cfBin -Argument "tunnel --config `"$configPath`" run" -WorkingDirectory $INSTALL_DIR
+$cfSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName "CloudDrive-Tunnel" -Action $cfAction -Trigger $trigger -Settings $cfSettings -RunLevel Highest -Force | Out-Null
+Start-ScheduledTask -TaskName "CloudDrive-Tunnel" -ErrorAction SilentlyContinue
+Write-Host "  Tunnel task registered." -ForegroundColor Green
 
-# USB Watcher task (runs every 10 sec via a loop inside the script)
-schtasks /delete /tn "UsbWatcher" /f 2>$null
-schtasks /create /tn "UsbWatcher" `
-    /tr "powershell.exe -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$INSTALL_DIR\usb-watcher.ps1`"" `
-    /sc ONSTART /ru SYSTEM /rl HIGHEST /f | Out-Null
-Copy-Item "$PSScriptRoot\usb-watcher.ps1" "$INSTALL_DIR\usb-watcher.ps1" -Force -ErrorAction SilentlyContinue
-schtasks /run /tn "UsbWatcher" | Out-Null
+# USB Watcher task
+$usbAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$INSTALL_DIR\usb-watcher.ps1`""
+Register-ScheduledTask -TaskName "CloudDrive-USBWatcher" -Action $usbAction -Trigger $trigger -Settings $settings -RunLevel Highest -Force | Out-Null
+Start-ScheduledTask -TaskName "CloudDrive-USBWatcher" -ErrorAction SilentlyContinue
 Write-Host "  USB Watcher task registered." -ForegroundColor Green
 
 # Wait a moment then test
 Start-Sleep 5
 try {
-    $r = Invoke-WebRequest -Uri "http://localhost:$NC_PORT/status.php" -UseBasicParsing -TimeoutSec 5
+    $r = Invoke-WebRequest -Uri "http://localhost:$NC_PORT/status.php" -UseBasicParsing -TimeoutSec 10
     $status = $r.Content | ConvertFrom-Json
     Write-Host "  Nextcloud running: v$($status.versionstring)" -ForegroundColor Green
-} catch { Write-Host "  Nextcloud not responding yet - may need a minute to start." -ForegroundColor Yellow }
+} catch { Write-Host "  Nextcloud not responding yet - may need a moment to start." -ForegroundColor Yellow }
 
 # ================================================================
 # DONE
